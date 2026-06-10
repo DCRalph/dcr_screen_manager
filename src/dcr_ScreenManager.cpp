@@ -344,6 +344,13 @@ void ScreenManager::ensureRegisteredBackgroundTaskRunning()
     return;
   }
 
+  if (backgroundWatchdogHandle != nullptr)
+  {
+    // Previous watchdog is still draining (≤200ms); retry next tick instead
+    // of logging a spurious start failure.
+    return;
+  }
+
   debugW("Restarting registered background task for '%s'", currentScreen->name);
   startRegisteredBackgroundTaskForCurrentScreen();
 }
@@ -365,8 +372,11 @@ void ScreenManager::backgroundTaskRunner(void *pvParameters)
       break;
     }
 
-    manager->backgroundTaskStepInProgress = true;
+    // Store the start time before raising the flag — the watchdog samples
+    // (inProgress, startMs) unsynchronized and must never pair the new flag
+    // with the previous step's start time.
     manager->backgroundTaskStepStartMs = millis();
+    manager->backgroundTaskStepInProgress = true;
     manager->backgroundTaskStep(ownerScreen);
     manager->backgroundTaskStepInProgress = false;
 
@@ -380,17 +390,22 @@ void ScreenManager::backgroundTaskRunner(void *pvParameters)
   }
 
   manager->backgroundTaskStepInProgress = false;
-  manager->backgroundTaskHandle = nullptr;
-  manager->backgroundTaskOwner = nullptr;
-  manager->backgroundTaskStep = nullptr;
-  manager->backgroundTaskShouldStop = false;
-  manager->backgroundTaskStepStartMs = 0;
 
-  if (manager->backgroundWatchdogHandle != nullptr)
+  // Clear the shared state only if this runner still owns it — a stale
+  // runner (e.g. orphaned by a watchdog-creation failure) must not clobber
+  // a newer run's fields. Never delete the watchdog from here: it always
+  // exits itself within one 200ms poll once the handle goes null or the
+  // generation changes.
+  taskENTER_CRITICAL(&manager->backgroundTaskMux);
+  if (manager->backgroundTaskHandle == xTaskGetCurrentTaskHandle())
   {
-    vTaskDelete(manager->backgroundWatchdogHandle);
-    manager->backgroundWatchdogHandle = nullptr;
+    manager->backgroundTaskHandle = nullptr;
+    manager->backgroundTaskOwner = nullptr;
+    manager->backgroundTaskStep = nullptr;
+    manager->backgroundTaskShouldStop = false;
+    manager->backgroundTaskStepStartMs = 0;
   }
+  taskEXIT_CRITICAL(&manager->backgroundTaskMux);
 
   vTaskDelete(NULL);
 }
@@ -404,7 +419,13 @@ void ScreenManager::backgroundTaskWatchdogRunner(void *pvParameters)
     return;
   }
 
-  while (manager->backgroundTaskHandle != nullptr)
+  // Snapshot the generation this watchdog belongs to. A new start cannot
+  // begin while this watchdog's handle is non-null, so a generation change
+  // means we are stale and must exit without touching the new run.
+  const uint32_t myGeneration = manager->backgroundTaskGeneration;
+
+  while (manager->backgroundTaskGeneration == myGeneration &&
+         manager->backgroundTaskHandle != nullptr)
   {
     if (manager->backgroundTaskStepInProgress)
     {
@@ -420,7 +441,13 @@ void ScreenManager::backgroundTaskWatchdogRunner(void *pvParameters)
     vTaskDelay(pdMS_TO_TICKS(200));
   }
 
-  manager->backgroundWatchdogHandle = nullptr;
+  // Compare-and-clear: only release the handle if it is still ours.
+  taskENTER_CRITICAL(&manager->backgroundTaskMux);
+  if (manager->backgroundWatchdogHandle == xTaskGetCurrentTaskHandle())
+  {
+    manager->backgroundWatchdogHandle = nullptr;
+  }
+  taskEXIT_CRITICAL(&manager->backgroundTaskMux);
   vTaskDelete(NULL);
 }
 
@@ -430,10 +457,24 @@ bool ScreenManager::startBackgroundTask(ScreenBackgroundStep stepCode,
                                         uint32_t loopDelayMs,
                                         uint32_t watchdogTimeoutMs)
 {
-  if (backgroundTaskHandle != nullptr || currentScreen == nullptr || stepCode == nullptr)
+  if (currentScreen == nullptr || stepCode == nullptr)
   {
     return false;
   }
+
+  // Claim the start slot. Start is reachable from multiple tasks (display
+  // task update() and MQTT applyPendingScreenChange()), and must also wait
+  // for a previous watchdog to finish draining (it self-exits within one
+  // 200ms poll once backgroundTaskHandle goes null).
+  taskENTER_CRITICAL(&backgroundTaskMux);
+  if (backgroundTaskHandle != nullptr || backgroundWatchdogHandle != nullptr || backgroundStartInProgress)
+  {
+    taskEXIT_CRITICAL(&backgroundTaskMux);
+    return false;
+  }
+  backgroundStartInProgress = true;
+  backgroundTaskGeneration++;
+  taskEXIT_CRITICAL(&backgroundTaskMux);
 
   backgroundTaskShouldStop = false;
   backgroundTaskOwner = currentScreen;
@@ -450,24 +491,24 @@ bool ScreenManager::startBackgroundTask(ScreenBackgroundStep stepCode,
     backgroundTaskStep = nullptr;
     backgroundTaskHandle = nullptr;
     backgroundTaskShouldStop = false;
+    backgroundStartInProgress = false;
     return false;
   }
 
   BaseType_t watchdogCreated = xTaskCreate(ScreenManager::backgroundTaskWatchdogRunner, "screenBgWdog", 3072, this, 2, &backgroundWatchdogHandle);
   if (watchdogCreated != pdPASS)
   {
-    TaskHandle_t taskToKill = backgroundTaskHandle;
-    backgroundTaskHandle = nullptr;
-    backgroundTaskOwner = nullptr;
-    backgroundTaskStep = nullptr;
+    // Do NOT vTaskDelete the runner (it may already be mid-step on the other
+    // core) and do NOT null the state fields: leaving backgroundTaskHandle
+    // set keeps the start gate closed until the runner observes shouldStop,
+    // exits on its own, and clears its own state.
+    backgroundWatchdogHandle = nullptr;
     backgroundTaskShouldStop = true;
-    if (taskToKill != nullptr)
-    {
-      vTaskDelete(taskToKill);
-    }
+    backgroundStartInProgress = false;
     return false;
   }
 
+  backgroundStartInProgress = false;
   return true;
 }
 

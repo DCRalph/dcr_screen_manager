@@ -47,7 +47,13 @@ private:
   bool popupShownForCurrentScreen = false;
   static const unsigned long BUTTON_CHECK_INTERVAL_MS = 10000; // 10 seconds
 
-  // Background task state (one task per active screen)
+  // Background task state (one task per active screen).
+  // Lifecycle rules: no task ever vTaskDeletes another task — the runner and
+  // watchdog always exit themselves. Compound reads/writes of the handles and
+  // state fields happen inside taskENTER_CRITICAL(&backgroundTaskMux), and
+  // each task clears a handle only if it still owns it (compare-and-clear).
+  // The handles stay non-volatile so xTaskCreate can write them directly
+  // (the kernel stores the out-param before the task becomes runnable).
   TaskHandle_t backgroundTaskHandle = nullptr;
   TaskHandle_t backgroundWatchdogHandle = nullptr;
   const Screen2 *backgroundTaskOwner = nullptr;
@@ -57,6 +63,11 @@ private:
   volatile bool backgroundTaskShouldStop = false;
   volatile bool backgroundTaskStepInProgress = false;
   volatile uint32_t backgroundTaskStepStartMs = 0;
+  // Bumped on every start; lets a stale watchdog detect it outlived its run.
+  volatile uint32_t backgroundTaskGeneration = 0;
+  // Serializes startBackgroundTask, which is reachable from multiple tasks.
+  volatile bool backgroundStartInProgress = false;
+  portMUX_TYPE backgroundTaskMux = portMUX_INITIALIZER_UNLOCKED;
 
   // Pluggable host hooks.
   ScreenPredicate exceptionScreenCheck = nullptr;
